@@ -224,13 +224,27 @@ func (m *JobManager) setJobs(state string, worker job.WorkerFn, action Action) {
 	}
 }
 
+func getStatusFmt(j *job.Job) string {
+	if j.NumProcs == 1 {
+		return fmt.Sprintf("[%s]: %s", j.Name, j.State[0])
+	}
+
+	msg := ""
+	for i := range j.NumProcs {
+		msg += fmt.Sprintf("[%s_%d]: %s", j.Name, i, j.State[i])
+		if i != j.NumProcs-1 {
+			msg += "\n"
+		}
+	}
+	return msg
+}
+
 func (m *JobManager) getStatus(action Action) {
 	if len(action.Args) != 1 {
 		action.Data <- "command accepts 1 argument only"
 		action.Done <- false
 		return
 	}
-	getStatusFmt := func(j *job.Job) string { return "[" + j.Name + "]: " + j.State }
 
 	name := action.Args[0]
 	if name != ALL {

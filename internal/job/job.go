@@ -17,24 +17,27 @@ import (
 type Job struct {
 	Name          string
 	Command       string
-	cmd           *exec.Cmd
+	cmds          []*exec.Cmd
 	Environment   []string
 	Dir           string
 	Autostart     bool
 	StdoutLogFile string
 	StderrLogFile string
 	Umask         string
-	State         string
+	State         []string
 	StartSecs     int
 	StartRetries  int
 	Autorestart   string
 	ExitCodes     []int
 	StopSignal    syscall.Signal
 	StopWaitSecs  int
-	_running      bool
-	_restarting   bool
+	_running      []bool
 	StdoutWriter  *utils.DynamicWriter
 	StderrWriter  *utils.DynamicWriter
+	NumProcs      int
+	pgid          int
+	mustart       sync.Mutex
+	mustop        sync.Mutex
 }
 
 func NewJob(name string, prog *config.Program) *Job {
@@ -50,6 +53,17 @@ func NewJob(name string, prog *config.Program) *Job {
 		exit_codes = append(exit_codes, 0)
 	}
 
+	states := make([]string, prog.NumProcs)
+	for i := range states {
+		states[i] = STOPPED
+	}
+
+	running := make([]bool, prog.NumProcs)
+
+	for i := range running {
+		running[i] = false
+	}
+
 	return &Job{
 		Name:          name,
 		Command:       prog.Command,
@@ -59,17 +73,19 @@ func NewJob(name string, prog *config.Program) *Job {
 		StdoutLogFile: prog.StdoutLogFile,
 		StderrLogFile: prog.StderrLogFile,
 		Umask:         prog.Umask,
-		State:         STOPPED,
+		State:         states,
 		StartSecs:     prog.StartSecs,
 		StartRetries:  prog.StartRetries,
 		Autorestart:   prog.Autorestart,
 		ExitCodes:     exit_codes,
 		StopSignal:    utils.ParseSignal(prog.StopSignal),
 		StopWaitSecs:  prog.StopWaitSecs,
-		_running:      false,
-		_restarting:   false,
+		_running:      running,
 		StdoutWriter:  &utils.DynamicWriter{},
 		StderrWriter:  &utils.DynamicWriter{},
+		NumProcs:      prog.NumProcs,
+		cmds:          make([]*exec.Cmd, prog.NumProcs),
+		pgid:          0,
 	}
 }
 
@@ -77,18 +93,41 @@ type WorkerFn = func(j *Job, wg *sync.WaitGroup, _done chan bool) error
 
 func (j *Job) Start(wg *sync.WaitGroup, _done chan bool) error {
 	defer func() { _done <- true }()
-	if j.Is(STOPPING) || j._running {
-		return nil
-	}
-	j._running = true
-	done := make(chan bool, 1)
+
+	j.mustart.Lock()
+	done := make(chan bool, j.NumProcs)
 	defer close(done)
-	go j.startJobWorker(wg, done)
-	<-done
+
+	for i := range j.NumProcs {
+		if j.Is(STOPPING, i) || j._running[i] {
+			done <- true
+			continue
+		}
+
+		j._running[i] = true
+
+		if j.HasPgid() {
+			go j.startJobWorker(wg, i, done, j.pgid)
+			continue
+		}
+
+		go j.startJobWorker(wg, i, done, 0)
+		<-done
+		done <- true
+		if !j.Is(RUNNING, 0) {
+			return fmt.Errorf("process could not be running")
+		}
+		j.pgid = j.cmds[i].Process.Pid
+	}
+
+	for range j.NumProcs {
+		<-done
+	}
+	j.mustart.Unlock()
 	return nil
 }
 
-func (j *Job) startJobWorker(wg *sync.WaitGroup, done chan bool) {
+func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, done chan bool, pgid int) {
 	wg.Add(1)
 	defer wg.Done()
 
@@ -99,17 +138,17 @@ func (j *Job) startJobWorker(wg *sync.WaitGroup, done chan bool) {
 	}
 
 	cmd := exec.Command(cmd_list[0], cmd_list[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: pgid}
 
-	j.cmd = cmd
+	j.cmds[id] = cmd
 
 	retries := 0
 	for {
-		j.SetState(STARTING)
-		err := j.tryStart()
+		j.SetState(STARTING, id)
+		err := j.tryStart(id)
 		if err != nil {
 			logger.Error(err)
-			j.SetState(BACKOFF)
+			j.SetState(BACKOFF, id)
 			retries++
 			if j.StartRetries == retries {
 				break
@@ -119,15 +158,15 @@ func (j *Job) startJobWorker(wg *sync.WaitGroup, done chan bool) {
 		}
 
 		cur_ts := int(time.Now().Unix())
-		j.SetState(RUNNING)
+		j.SetState(RUNNING, id)
 		done <- true
-		state, _ := j.cmd.Process.Wait()
-		j.cmd.ProcessState = state
+		state, _ := j.cmds[id].Process.Wait()
+		j.cmds[id].ProcessState = state
 
-		if j.Is(STOPPING) {
+		if j.Is(STOPPING, id) {
 			break
 		} else if int(time.Now().Unix())-cur_ts < j.StartSecs {
-			j.SetState(BACKOFF)
+			j.SetState(BACKOFF, id)
 			retries++
 			if j.StartRetries == retries {
 				break
@@ -136,25 +175,25 @@ func (j *Job) startJobWorker(wg *sync.WaitGroup, done chan bool) {
 			continue
 		}
 
-		j.SetState(EXITED)
+		j.SetState(EXITED, id)
 		retries = 0
 		if j.Autorestart == AUTORESTART_FALSE {
 			break
 		}
 		if j.Autorestart == AUTORESTART_UNEXPECTED {
 			for exit := range j.ExitCodes {
-				if exit == j.cmd.ProcessState.ExitCode() {
+				if exit == j.cmds[id].ProcessState.ExitCode() {
 					break
 				}
 			}
 		}
 	}
-	if j.Is(BACKOFF) {
-		j.SetState(FATAL)
-	} else if j.Is(STOPPING) {
-		j.SetState(STOPPED)
+	if j.Is(BACKOFF, id) {
+		j.SetState(FATAL, id)
+	} else if j.Is(STOPPING, id) {
+		j.SetState(STOPPED, id)
 	}
-	j._running = false
+	j._running[id] = false
 }
 
 func (j *Job) setLog(file string, writer *utils.DynamicWriter, _default io.Writer) error {
@@ -171,7 +210,7 @@ func (j *Job) setLog(file string, writer *utils.DynamicWriter, _default io.Write
 	return nil
 }
 
-func (j *Job) tryStart() error {
+func (j *Job) tryStart(procId int) error {
 	err := j.setLog(j.StdoutLogFile, j.StdoutWriter, os.Stdout)
 	if err != nil {
 		return err
@@ -182,13 +221,13 @@ func (j *Job) tryStart() error {
 		return err
 	}
 
-	j.cmd.Stdout = j.StdoutWriter
-	j.cmd.Stderr = j.StderrWriter
+	j.cmds[procId].Stdout = j.StdoutWriter
+	j.cmds[procId].Stderr = j.StderrWriter
 
-	j.cmd.Env = append(j.Environment, os.Environ()...)
-	j.cmd.Dir = j.Dir
+	j.cmds[procId].Env = append(j.Environment, os.Environ()...)
+	j.cmds[procId].Dir = j.Dir
 
-	err = j.cmd.Start()
+	err = j.cmds[procId].Start()
 	if err != nil {
 		return err
 	}
@@ -197,43 +236,43 @@ func (j *Job) tryStart() error {
 }
 
 func (j *Job) Restart(wg *sync.WaitGroup, _done chan bool) error {
-	if j.Is(STOPPING) || j._restarting {
-		return nil
-	}
-
-	j._restarting = true
 	done := make(chan bool, 1)
 	defer close(done)
 	j.Stop(wg, done)
 	j.Start(wg, _done)
-	j._restarting = false
 	return nil
 }
 
 func (j *Job) Stop(wg *sync.WaitGroup, _done chan bool) error {
 	defer func() { _done <- true }()
-	if j.Is(STOPPING) {
-		return nil
-	}
+	j.mustop.Lock()
 
-	if j.Is(RUNNING) {
-		j.SetState(STOPPING)
+	if j.HasPgid() {
+		for i := range j.NumProcs {
+			j.SetState(STOPPING, i)
+		}
 		cur := time.Now().Unix()
-		err := syscall.Kill(-j.cmd.Process.Pid, syscall.SIGKILL)
+		err := syscall.Kill(-j.pgid, syscall.SIGKILL)
 		if err != nil {
 			return err
 		}
 
-		for time.Now().Unix()-cur < int64(j.StopWaitSecs) && j._running {
+		for time.Now().Unix()-cur < int64(j.StopWaitSecs) && j.IsRunning() {
 			time.Sleep(100 * time.Millisecond)
 		}
 
-		if j._running {
-			err = syscall.Kill(-j.cmd.Process.Pid, j.StopSignal)
+		if j.HasPgid() {
+			err = syscall.Kill(-j.pgid, j.StopSignal)
 			return err
+		}
+
+		for j.IsRunning() {
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
+	j.SetPgid(0)
+	j.mustop.Unlock()
 	return nil
 }
 
@@ -244,7 +283,7 @@ func (j *Job) Reload(wg *sync.WaitGroup, _done chan bool, prog *config.Program) 
 	stdoutChanged := j.StdoutLogFile != prog.StdoutLogFile
 	stderrChanged := j.StderrLogFile != prog.StderrLogFile
 	shouldRestart := j.reread(prog)
-	if shouldRestart && j._running {
+	if shouldRestart && j.IsRunning() {
 		go j.Restart(wg, _done)
 		return nil
 	}

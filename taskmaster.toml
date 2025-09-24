@@ -19,7 +19,8 @@ startretries = 10
 command = "ping 0.0.0.0"
 stdout_logfile = "three.log"
 
-# [program.four]
-# # autostart = false
-# command = "ping google.com"
-# stdout_logfile = "four.log"
+[program.four]
+# autostart = false
+command = "ping google.com"
+stdout_logfile = "four.log"
+numprocs = 3
