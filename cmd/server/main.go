@@ -10,6 +10,8 @@ import (
 )
 
 func main() {
+	logger.Init()
+
 	setup, err := utils.ParseSetupFile()
 	if err != nil {
 		logger.Critical(err)
