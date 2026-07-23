@@ -2,14 +2,11 @@ package logger
 
 import (
 	"fmt"
-	"log"
 	"log/syslog"
 	"os"
 	"sync"
 	"time"
 )
-
-const fallbackLogFile = "/var/log/taskmaster.log"
 
 type LogLevel uint8
 
@@ -36,11 +33,9 @@ func (lvl LogLevel) String() string {
 }
 
 type Logger struct {
-	level          LogLevel
-	mutex          sync.Mutex
-	syslogger      *syslog.Writer
-	fallbackLogger *log.Logger
-	fallbackFile   *os.File
+	level     LogLevel
+	mutex     sync.Mutex
+	syslogger *syslog.Writer
 }
 
 var logger Logger
@@ -49,18 +44,12 @@ func Init() {
 	syslogger, err := syslog.New(syslog.LOG_INFO, "taskmaster")
 
 	if err != nil {
-		f, fileErr := os.OpenFile(fallbackLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if fileErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: syslog and file logging unavailable: syslog=%v file=%v\n", err, fileErr)
-		} else {
-			fmt.Fprintf(os.Stderr, "Warning: syslog unavailable, falling back to %s\n", fallbackLogFile)
-			logger = Logger{
-				level:          InfoLevel,
-				fallbackLogger: log.New(f, "", 0),
-				fallbackFile:   f,
-			}
-			return
-		}
+		fmt.Fprintln(os.Stderr, "ERROR: syslog unavailable. To fix this, configure a syslog log driver in Docker:")
+		fmt.Fprintln(os.Stderr, "  compose.yaml:  logging:\n                  driver: syslog\n                  options:\n                    syslog-address: \"unix:///dev/log\"\n                    tag: \"taskmaster\"")
+		fmt.Fprintln(os.Stderr, "  or run with:    docker run --log-driver=syslog --log-opt syslog-address=unix:///dev/log ...")
+		fmt.Fprintln(os.Stderr, "  or set as default in /etc/docker/daemon.json: { \"log-driver\": \"syslog\" }")
+		fmt.Fprintln(os.Stderr, "Original error:", err)
+		os.Exit(1)
 	}
 
 	logger = Logger{
@@ -73,92 +62,60 @@ func SetLevel(level LogLevel) {
 	logger.level = level
 }
 
-func (l *Logger) writeSyslog(message string) {
-	if l.syslogger != nil {
-		l.syslogger.Info(message)
-	} else if l.fallbackLogger != nil {
-		l.fallbackLogger.Println(message)
-	}
-}
-
-func (l *Logger) writeSyslogWarn(message string) {
-	if l.syslogger != nil {
-		l.syslogger.Warning(message)
-	} else if l.fallbackLogger != nil {
-		l.fallbackLogger.Println(message)
-	}
-}
-
-func (l *Logger) writeSyslogErr(message string) {
-	if l.syslogger != nil {
-		l.syslogger.Err(message)
-	} else if l.fallbackLogger != nil {
-		l.fallbackLogger.Println(message)
-	}
-}
-
-func (l *Logger) writeSyslogCrit(message string) {
-	if l.syslogger != nil {
-		l.syslogger.Crit(message)
-	} else if l.fallbackLogger != nil {
-		l.fallbackLogger.Println(message)
-	}
-}
-
 func Info(a any) {
 	logger.log(InfoLevel, a)
 
 	message := fmt.Sprintf("%v", a)
-	logger.writeSyslog(message)
+	logger.syslogger.Info(message)
 }
 
 func Infof(format string, a ...any) {
 	message := fmt.Sprintf(format, a...)
 	logger.log(InfoLevel, message)
 
-	logger.writeSyslog(message)
+	logger.syslogger.Info(message)
 }
 
 func Warn(a any) {
 	logger.log(WarnLevel, a)
 
 	message := fmt.Sprintf("%v", a)
-	logger.writeSyslogWarn(message)
+	logger.syslogger.Warning(message)
 }
 
 func Warnf(format string, a ...any) {
 	message := fmt.Sprintf(format, a...)
 	logger.log(WarnLevel, message)
 
-	logger.writeSyslogWarn(message)
+	logger.syslogger.Warning(message)
 }
 
 func Error(a any) {
 	logger.log(ErrorLevel, a)
 
 	message := fmt.Sprintf("%v", a)
-	logger.writeSyslogErr(message)
+	logger.syslogger.Err(message)
 }
 
 func Errorf(format string, a ...any) {
 	message := fmt.Sprintf(format, a...)
 	logger.log(ErrorLevel, message)
 
-	logger.writeSyslogErr(message)
+	logger.syslogger.Err(message)
 }
 
 func Critical(a any) {
 	logger.log(CriticalLevel, a)
 
 	message := fmt.Sprintf("%v", a)
-	logger.writeSyslogCrit(message)
+	logger.syslogger.Crit(message)
 }
 
 func Criticalf(format string, a ...any) {
 	message := fmt.Sprintf(format, a...)
 	logger.log(CriticalLevel, message)
 
-	logger.writeSyslogCrit(message)
+	logger.syslogger.Crit(message)
 }
 
 func (l *Logger) log(level LogLevel, a any) {
