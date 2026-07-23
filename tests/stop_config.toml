@@ -1,0 +1,7 @@
+[program.termtest]
+command = "trap '' TERM; sleep 3600"
+autostart = true
+autorestart = "false"
+startsecs = 0
+stopsignal = "TERM"
+stopwaitsecs = 3

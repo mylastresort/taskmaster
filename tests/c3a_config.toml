@@ -1,0 +1,7 @@
+[program.exitok]
+command = "exit 0"
+autostart = true
+autorestart = "unexpected"
+startsecs = 0
+exitcodes = [0]
+startretries = 3

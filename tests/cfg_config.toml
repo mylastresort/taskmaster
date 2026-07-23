@@ -1,0 +1,34 @@
+[program.numtest]
+command = "sleep 3600"
+autostart = true
+autorestart = "false"
+numprocs = 3
+startsecs = 0
+[program.envtest]
+command = "env"
+autostart = false
+autorestart = "false"
+environment = ["MY_VAR=hello42", "ANOTHER=world"]
+stdout_logfile = "/tmp/test_taskmaster/env.log"
+startsecs = 0
+[program.dirtest]
+command = "pwd"
+autostart = false
+autorestart = "false"
+directory = "/tmp"
+stdout_logfile = "/tmp/test_taskmaster/dir.log"
+startsecs = 0
+[program.umasktest]
+command = "umask"
+autostart = false
+autorestart = "false"
+umask = "0077"
+stdout_logfile = "/tmp/test_taskmaster/umask.log"
+startsecs = 0
+[program.logtest]
+command = "sleep 3600"
+autostart = false
+autorestart = "false"
+stdout_logfile = "/tmp/test_taskmaster/stdout.log"
+stderr_logfile = "/tmp/test_taskmaster/stderr.log"
+startsecs = 0

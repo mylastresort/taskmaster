@@ -11,6 +11,11 @@ import (
 	"github.com/Archer-01/taskmaster/internal/utils"
 )
 
+type AttachSession struct {
+	JobName string
+	Done    chan struct{}
+}
+
 const (
 	QUIT    = "quit"
 	RELOAD  = "reload"
@@ -18,6 +23,8 @@ const (
 	STOP    = "stop"
 	RESTART = "restart"
 	ALL     = "all"
+	ATTACH  = "attach"
+	DETACH  = "detach"
 )
 
 type Action struct {
@@ -161,10 +168,14 @@ func (m *JobManager) Run() {
 			action.Done <- true
 			return
 
-		case RELOAD:
-			logger.Warn("Reloading...")
-			m.reload()
+	case RELOAD:
+		logger.Warn("Reloading...")
+		if err := m.reload(); err != nil {
+			action.Data <- err.Error()
+			action.Done <- false
+		} else {
 			action.Done <- true
+		}
 
 		case START:
 			m.setJobs("STARTING", (*job.Job).Start, action)
@@ -271,6 +282,29 @@ func (m *JobManager) getStatus(action Action) {
 		action.Data <- msg
 		action.Done <- true
 	}
+}
+
+func (m *JobManager) AttachJob(name string) (*os.File, error) {
+	j, found := m.Jobs[name]
+	if !found {
+		return nil, fmt.Errorf("job is not recognized")
+	}
+	if !j.IsRunning() {
+		return nil, fmt.Errorf("process is not running")
+	}
+	fd := j.Attach()
+	if fd == nil {
+		return nil, fmt.Errorf("could not attach to process")
+	}
+	return fd, nil
+}
+
+func (m *JobManager) DetachJob(name string) {
+	j, found := m.Jobs[name]
+	if !found {
+		return
+	}
+	j.Detach()
 }
 
 func (m *JobManager) stop() {

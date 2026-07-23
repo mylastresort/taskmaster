@@ -1,0 +1,7 @@
+[program.retries]
+command = "exit 1"
+autostart = true
+autorestart = "false"
+startsecs = 1
+startretries = 2
+exitcodes = [0]

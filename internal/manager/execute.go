@@ -2,6 +2,7 @@ package manager
 
 import (
 	"fmt"
+	"os"
 )
 
 const (
@@ -9,8 +10,9 @@ const (
 )
 
 type Response struct {
-	Data string
-	Err  error
+	Data     string
+	Err      error
+	AttachFd *os.File
 }
 
 func NewResponse() *Response {
@@ -31,6 +33,12 @@ func BadRequest(err error) *Response {
 	return &Response{
 		Data: "",
 		Err:  err,
+	}
+}
+
+func NewAttachResponse(fd *os.File) *Response {
+	return &Response{
+		AttachFd: fd,
 	}
 }
 
@@ -63,6 +71,23 @@ func (m *JobManager) Execute(action string, args ...string) *Response {
 		} else {
 			return BadRequest(fmt.Errorf(<-data))
 		}
+
+	case ATTACH:
+		if len(args) != 1 {
+			return BadRequest(fmt.Errorf("attach requires 1 argument"))
+		}
+		fd, err := m.AttachJob(args[0])
+		if err != nil {
+			return BadRequest(err)
+		}
+		return NewAttachResponse(fd)
+
+	case DETACH:
+		if len(args) != 1 {
+			return NewResponse()
+		}
+		m.DetachJob(args[0])
+		return NewResponse()
 	}
 	return BadRequest(fmt.Errorf("%s Unknown command", action))
 }

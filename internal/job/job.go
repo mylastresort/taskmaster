@@ -12,6 +12,8 @@ import (
 	"github.com/Archer-01/taskmaster/internal/logger"
 	"github.com/Archer-01/taskmaster/internal/parser/config"
 	"github.com/Archer-01/taskmaster/internal/utils"
+	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 )
 
 type Job struct {
@@ -36,14 +38,19 @@ type Job struct {
 	StderrWriter  *utils.DynamicWriter
 	NumProcs      int
 	pgid          int
-	mustart       sync.Mutex
+	startReady    chan struct{}
+	startOnce     sync.Once
 	mustop        sync.Mutex
+	ptyFd         *os.File
+	ptyLoggerStop chan struct{}
+	ptyLoggerDone chan struct{}
+	ptyCloseOnce  sync.Once
 }
 
 func NewJob(name string, prog *config.Program) *Job {
 	has_zero := false
 	exit_codes := prog.ExitCodes
-	for exit := range exit_codes {
+	for _, exit := range exit_codes {
 		if exit == 0 {
 			has_zero = true
 			break
@@ -63,6 +70,9 @@ func NewJob(name string, prog *config.Program) *Job {
 	for i := range running {
 		running[i] = false
 	}
+
+	ch := make(chan struct{})
+	close(ch)
 
 	return &Job{
 		Name:          name,
@@ -86,7 +96,14 @@ func NewJob(name string, prog *config.Program) *Job {
 		NumProcs:      prog.NumProcs,
 		cmds:          make([]*exec.Cmd, prog.NumProcs),
 		pgid:          0,
+		startReady:    ch,
 	}
+}
+
+func (j *Job) closeStartReady() {
+	j.startOnce.Do(func() {
+		close(j.startReady)
+	})
 }
 
 type WorkerFn = func(j *Job, wg *sync.WaitGroup, _done chan bool) error
@@ -94,61 +111,52 @@ type WorkerFn = func(j *Job, wg *sync.WaitGroup, _done chan bool) error
 func (j *Job) Start(wg *sync.WaitGroup, _done chan bool) error {
 	defer func() { _done <- true }()
 
-	j.mustart.Lock()
-	done := make(chan bool, j.NumProcs)
-	defer close(done)
+	j.mustop.Lock()
+	defer j.mustop.Unlock()
+
+	startReady := make(chan struct{})
+	j.startReady = startReady
+	j.startOnce = sync.Once{}
 
 	for i := range j.NumProcs {
 		if j.Is(STOPPING, i) || j._running[i] {
-			done <- true
 			continue
 		}
 
 		j._running[i] = true
 
 		if j.HasPgid() {
-			go j.startJobWorker(wg, i, done, j.pgid)
+			go j.startJobWorker(wg, i, j.pgid)
 			continue
 		}
 
-		go j.startJobWorker(wg, i, done, 0)
-		<-done
-		done <- true
+		go j.startJobWorker(wg, i, 0)
+		<-startReady
 		if !j.Is(RUNNING, 0) {
 			return fmt.Errorf("process could not be running")
 		}
 		j.pgid = j.cmds[i].Process.Pid
 	}
 
-	for range j.NumProcs {
-		<-done
-	}
-	j.mustart.Unlock()
 	return nil
 }
 
-func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, done chan bool, pgid int) {
+func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, pgid int) {
 	wg.Add(1)
 	defer wg.Done()
 
-	cmd_list := []string{
-		"sh",
-		"-c",
-		fmt.Sprintf("umask %v && %v", j.Umask, j.Command),
-	}
-
-	cmd := exec.Command(cmd_list[0], cmd_list[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: pgid}
-
-	j.cmds[id] = cmd
-
 	retries := 0
 	for {
+		cmd := exec.Command("sh", "-c", fmt.Sprintf("umask %v && %v", j.Umask, j.Command))
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		j.cmds[id] = cmd
+
 		j.SetState(STARTING, id)
 		err := j.tryStart(id)
 		if err != nil {
 			logger.Error(err)
 			j.SetState(BACKOFF, id)
+			j.closeStartReady()
 			retries++
 			if j.StartRetries == retries {
 				break
@@ -159,7 +167,7 @@ func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, done chan bool, pgid in
 
 		cur_ts := int(time.Now().Unix())
 		j.SetState(RUNNING, id)
-		done <- true
+		j.closeStartReady()
 		state, _ := j.cmds[id].Process.Wait()
 		j.cmds[id].ProcessState = state
 
@@ -181,10 +189,15 @@ func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, done chan bool, pgid in
 			break
 		}
 		if j.Autorestart == AUTORESTART_UNEXPECTED {
-			for exit := range j.ExitCodes {
+			expected := false
+			for _, exit := range j.ExitCodes {
 				if exit == j.cmds[id].ProcessState.ExitCode() {
+					expected = true
 					break
 				}
+			}
+			if expected {
+				break
 			}
 		}
 	}
@@ -194,6 +207,17 @@ func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, done chan bool, pgid in
 		j.SetState(STOPPED, id)
 	}
 	j._running[id] = false
+
+	if j.ptyLoggerStop != nil {
+		select {
+		case <-j.ptyLoggerStop:
+		default:
+			close(j.ptyLoggerStop)
+		}
+	}
+	if j.ptyLoggerDone != nil {
+		<-j.ptyLoggerDone
+	}
 }
 
 func (j *Job) setLog(file string, writer *utils.DynamicWriter, _default io.Writer) error {
@@ -210,27 +234,107 @@ func (j *Job) setLog(file string, writer *utils.DynamicWriter, _default io.Write
 	return nil
 }
 
+func (j *Job) ptyLogger(ptyMaster *os.File, stop chan struct{}, doneOnce *sync.Once, done chan struct{}) {
+	defer doneOnce.Do(func() { close(done) })
+
+	stopR, stopW, _ := os.Pipe()
+	go func() {
+		<-stop
+		stopW.Close()
+	}()
+	defer stopR.Close()
+
+	fd := int(ptyMaster.Fd())
+	stopFd := int(stopR.Fd())
+	buf := make([]byte, 4096)
+
+	for {
+		fds := []unix.PollFd{
+			{Fd: int32(fd), Events: unix.POLLIN},
+			{Fd: int32(stopFd), Events: unix.POLLIN},
+		}
+		n, err := unix.Poll(fds, -1)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			return
+		}
+		if n == 0 {
+			continue
+		}
+		if fds[1].Revents != 0 {
+			return
+		}
+		if fds[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0 {
+			nr, rerr := ptyMaster.Read(buf)
+			if nr > 0 {
+				j.StdoutWriter.Write(buf[:nr])
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}
+}
+
+func (j *Job) Attach() *os.File {
+	if j.ptyFd == nil {
+		fmt.Fprintf(os.Stderr, "process is not running or does not have a pty\n")
+		return nil
+	}
+	select {
+	case <-j.ptyLoggerStop:
+	default:
+		close(j.ptyLoggerStop)
+	}
+	<-j.ptyLoggerDone
+	return j.ptyFd
+}
+
+func (j *Job) Detach() {
+	if j.ptyFd == nil {
+		return
+	}
+	j.ptyLoggerStop = make(chan struct{})
+	j.ptyLoggerDone = make(chan struct{})
+	j.ptyCloseOnce = sync.Once{}
+	go j.ptyLogger(j.ptyFd, j.ptyLoggerStop, &j.ptyCloseOnce, j.ptyLoggerDone)
+}
+
 func (j *Job) tryStart(procId int) error {
-	err := j.setLog(j.StdoutLogFile, j.StdoutWriter, os.Stdout)
-	if err != nil {
-		return err
+	cmd := j.cmds[procId]
+
+	cmd.Env = append(j.Environment, os.Environ()...)
+	cmd.Dir = j.Dir
+
+	j.setLog(j.StdoutLogFile, j.StdoutWriter, os.Stdout)
+	j.setLog(j.StderrLogFile, j.StderrWriter, os.Stderr)
+
+	if j.ptyLoggerStop != nil {
+		select {
+		case <-j.ptyLoggerStop:
+		default:
+			close(j.ptyLoggerStop)
+		}
+		if j.ptyLoggerDone != nil {
+			<-j.ptyLoggerDone
+		}
 	}
 
-	err = j.setLog(j.StderrLogFile, j.StderrWriter, os.Stderr)
-	if err != nil {
-		return err
+	j.ptyLoggerStop = make(chan struct{})
+	j.ptyLoggerDone = make(chan struct{})
+	j.ptyCloseOnce = sync.Once{}
+
+	ptmx, ptyErr := pty.Start(cmd)
+	if ptyErr != nil {
+		return ptyErr
 	}
+	j.ptyFd = ptmx
 
-	j.cmds[procId].Stdout = j.StdoutWriter
-	j.cmds[procId].Stderr = j.StderrWriter
+	pty.Setsize(ptmx, &pty.Winsize{Rows: 24, Cols: 80})
 
-	j.cmds[procId].Env = append(j.Environment, os.Environ()...)
-	j.cmds[procId].Dir = j.Dir
-
-	err = j.cmds[procId].Start()
-	if err != nil {
-		return err
-	}
+	go j.ptyLogger(ptmx, j.ptyLoggerStop, &j.ptyCloseOnce, j.ptyLoggerDone)
 
 	return nil
 }
@@ -245,25 +349,30 @@ func (j *Job) Restart(wg *sync.WaitGroup, _done chan bool) error {
 
 func (j *Job) Stop(wg *sync.WaitGroup, _done chan bool) error {
 	defer func() { _done <- true }()
+	<-j.startReady
 	j.mustop.Lock()
+	defer j.mustop.Unlock()
 
 	if j.HasPgid() {
 		for i := range j.NumProcs {
 			j.SetState(STOPPING, i)
 		}
-		cur := time.Now().Unix()
-		err := syscall.Kill(-j.pgid, syscall.SIGKILL)
+
+		err := syscall.Kill(-j.pgid, j.StopSignal)
 		if err != nil {
 			return err
 		}
 
+		cur := time.Now().Unix()
 		for time.Now().Unix()-cur < int64(j.StopWaitSecs) && j.IsRunning() {
 			time.Sleep(100 * time.Millisecond)
 		}
 
-		if j.HasPgid() {
-			err = syscall.Kill(-j.pgid, j.StopSignal)
-			return err
+		if j.HasPgid() && j.IsRunning() {
+			err = syscall.Kill(-j.pgid, syscall.SIGKILL)
+			if err != nil {
+				return err
+			}
 		}
 
 		for j.IsRunning() {
@@ -272,7 +381,6 @@ func (j *Job) Stop(wg *sync.WaitGroup, _done chan bool) error {
 	}
 
 	j.SetPgid(0)
-	j.mustop.Unlock()
 	return nil
 }
 
