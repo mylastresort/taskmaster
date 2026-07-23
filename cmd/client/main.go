@@ -69,7 +69,7 @@ func main() {
 
 		res := client.Read(server.DEL)
 		if res.Err != nil {
-			utils.Errorf(err.Error())
+			utils.Errorf(res.Err.Error())
 		} else if res.HasContent() {
 			utils.Logf(res.Data)
 		}

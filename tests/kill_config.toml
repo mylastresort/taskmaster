@@ -1,0 +1,6 @@
+[program.killtest]
+command = "sleep 3600"
+autostart = true
+autorestart = "true"
+startsecs = 0
+startretries = 3

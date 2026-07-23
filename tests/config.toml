@@ -1,0 +1,62 @@
+[program.stayalive]
+command = "sleep 3600"
+autostart = true
+autorestart = "true"
+numprocs = 1
+stdout_logfile = "/tmp/test_taskmaster/stayalive.log"
+stderr_logfile = "/tmp/test_taskmaster/stayalive_err.log"
+
+[program.fastexit]
+command = "exit 0"
+autostart = false
+autorestart = "false"
+exitcodes = [0]
+
+[program.error_exit]
+command = "exit 1"
+autostart = false
+autorestart = "true"
+exitcodes = [0]
+startretries = 3
+startsecs = 1
+
+[program.multihello]
+command = "echo hello"
+autostart = false
+autorestart = "false"
+numprocs = 3
+stdout_logfile = "/tmp/test_taskmaster/multi.log"
+startsecs = 0
+
+[program.envcheck]
+command = "env"
+autostart = false
+autorestart = "false"
+environment = ["MY_VAR=hello42", "ANOTHER_VAR=world"]
+stdout_logfile = "/tmp/test_taskmaster/env.log"
+startsecs = 0
+
+[program.dircheck]
+command = "pwd"
+autostart = false
+autorestart = "false"
+directory = "/tmp"
+stdout_logfile = "/tmp/test_taskmaster/dir.log"
+startsecs = 0
+
+[program.umaskcheck]
+command = "umask"
+autostart = false
+autorestart = "false"
+umask = "0077"
+stdout_logfile = "/tmp/test_taskmaster/umask.log"
+startsecs = 0
+
+[program.graceful]
+command = "sleep 3600"
+autostart = false
+autorestart = "false"
+stopsignal = "TERM"
+stopwaitsecs = 3
+numprocs = 1
+startsecs = 0
