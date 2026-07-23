@@ -7,8 +7,5 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
-    logging:
-      driver: syslog
-      options:
-        syslog-address: "unix:///dev/log"
-        tag: "taskmaster"
+    volumes:
+      - /dev/log:/dev/log
