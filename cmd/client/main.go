@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/Archer-01/taskmaster/internal/client"
 	"github.com/Archer-01/taskmaster/internal/parser/interpreter"
@@ -102,21 +104,32 @@ func main() {
 }
 
 func handleAttach(c *client.Client) {
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	stdinFd := int(os.Stdin.Fd())
+
+	oldState, err := term.MakeRaw(stdinFd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to enter raw mode: %v\n", err)
 		return
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
 	fmt.Fprintf(os.Stderr, "\r\n[Attached to process. Press Ctrl+A then D to detach.]\r\n")
 
-	done := make(chan struct{})
+	stop := make(chan struct{})
 	detach := make(chan struct{})
+	goroutineDone := make(chan struct{})
+
+	oldflags, _, _ := syscall.Syscall(syscall.SYS_FCNTL, uintptr(stdinFd), syscall.F_GETFL, 0)
+	syscall.Syscall(syscall.SYS_FCNTL, uintptr(stdinFd), syscall.F_SETFL, oldflags|syscall.O_NONBLOCK)
 
 	go func() {
+		defer close(goroutineDone)
 		buf := make([]byte, 4096)
 		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			n, err := os.Stdin.Read(buf)
 			if n > 0 {
 				if n >= 2 && buf[0] == 0x01 && buf[1] == 0x04 {
@@ -127,16 +140,20 @@ func handleAttach(c *client.Client) {
 				c.Socket.Write(buf[:n])
 			}
 			if err != nil {
-				return
+				time.Sleep(time.Millisecond)
 			}
 		}
 	}()
 
 	go func() {
-		defer close(done)
 		var buf []byte
 		tmp := make([]byte, 4096)
 		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			n, err := c.Rd.Read(tmp)
 			if n > 0 {
 				buf = append(buf, tmp[:n]...)
@@ -148,6 +165,7 @@ func handleAttach(c *client.Client) {
 					if idx > 0 {
 						os.Stdout.Write(buf[:idx])
 					}
+					close(stop)
 					return
 				}
 				if len(buf) > 0 && !bytes.Contains(buf, []byte("DETACH")) {
@@ -159,6 +177,7 @@ func handleAttach(c *client.Client) {
 				if len(buf) > 0 {
 					os.Stdout.Write(buf)
 				}
+				close(stop)
 				return
 			}
 		}
@@ -166,8 +185,12 @@ func handleAttach(c *client.Client) {
 
 	select {
 	case <-detach:
-	case <-done:
+	case <-stop:
 	}
-	term.Restore(int(os.Stdin.Fd()), oldState)
+
+	<-goroutineDone
+
+	syscall.Syscall(syscall.SYS_FCNTL, uintptr(stdinFd), syscall.F_SETFL, oldflags)
+	term.Restore(stdinFd, oldState)
 	fmt.Fprintf(os.Stderr, "\r\n[Detached.]\r\n")
 }
