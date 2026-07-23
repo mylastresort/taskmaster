@@ -6,8 +6,6 @@ import (
 	"os"
 	"sync"
 	"time"
-
-	"github.com/Archer-01/taskmaster/internal/utils"
 )
 
 type LogLevel uint8
@@ -46,7 +44,11 @@ func Init() {
 	syslogger, err := syslog.New(syslog.LOG_INFO, "taskmaster")
 
 	if err != nil {
-		utils.Errorf(err.Error())
+		fmt.Fprintln(os.Stderr, "ERROR: syslog unavailable. To fix this, configure a syslog log driver in Docker:")
+		fmt.Fprintln(os.Stderr, "  compose.yaml:  logging:\n                  driver: syslog\n                  options:\n                    syslog-address: \"unix:///dev/log\"\n                    tag: \"taskmaster\"")
+		fmt.Fprintln(os.Stderr, "  or run with:    docker run --log-driver=syslog --log-opt syslog-address=unix:///dev/log ...")
+		fmt.Fprintln(os.Stderr, "  or set as default in /etc/docker/daemon.json: { \"log-driver\": \"syslog\" }")
+		fmt.Fprintln(os.Stderr, "Original error:", err)
 		os.Exit(1)
 	}
 
