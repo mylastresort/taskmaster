@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -133,13 +134,31 @@ func handleAttach(c *client.Client) {
 
 	go func() {
 		defer close(done)
-		buf := make([]byte, 4096)
+		var buf []byte
+		tmp := make([]byte, 4096)
 		for {
-			n, err := c.Rd.Read(buf)
+			n, err := c.Rd.Read(tmp)
 			if n > 0 {
-				os.Stdout.Write(buf[:n])
+				buf = append(buf, tmp[:n]...)
+				for {
+					idx := bytes.Index(buf, []byte("DETACH OK\r"))
+					if idx < 0 {
+						break
+					}
+					if idx > 0 {
+						os.Stdout.Write(buf[:idx])
+					}
+					return
+				}
+				if len(buf) > 0 && !bytes.Contains(buf, []byte("DETACH")) {
+					os.Stdout.Write(buf)
+					buf = nil
+				}
 			}
 			if err != nil {
+				if len(buf) > 0 {
+					os.Stdout.Write(buf)
+				}
 				return
 			}
 		}

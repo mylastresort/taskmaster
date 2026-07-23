@@ -91,6 +91,7 @@ func (_sv *Server) handleConnection(del byte, s *Socket, wg *sync.WaitGroup) {
 				s.Con.Write([]byte("ATTACH OK" + string(del)))
 				_sv.handleAttach(s, res.AttachFd)
 				_sv.j.Execute(manager.DETACH, args[0])
+				s.Con.Write([]byte("DETACH OK" + string(del)))
 				continue
 			}
 
