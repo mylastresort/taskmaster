@@ -161,10 +161,14 @@ func (m *JobManager) Run() {
 			action.Done <- true
 			return
 
-		case RELOAD:
-			logger.Warn("Reloading...")
-			m.reload()
+	case RELOAD:
+		logger.Warn("Reloading...")
+		if err := m.reload(); err != nil {
+			action.Data <- err.Error()
+			action.Done <- false
+		} else {
 			action.Done <- true
+		}
 
 		case START:
 			m.setJobs("STARTING", (*job.Job).Start, action)

@@ -1,0 +1,6 @@
+[program.fastexit]
+command = "exit 0"
+autostart = true
+autorestart = "false"
+startsecs = 1
+startretries = 3

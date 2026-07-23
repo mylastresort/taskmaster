@@ -36,14 +36,15 @@ type Job struct {
 	StderrWriter  *utils.DynamicWriter
 	NumProcs      int
 	pgid          int
-	mustart       sync.Mutex
+	startReady    chan struct{}
+	startOnce     sync.Once
 	mustop        sync.Mutex
 }
 
 func NewJob(name string, prog *config.Program) *Job {
 	has_zero := false
 	exit_codes := prog.ExitCodes
-	for exit := range exit_codes {
+	for _, exit := range exit_codes {
 		if exit == 0 {
 			has_zero = true
 			break
@@ -63,6 +64,9 @@ func NewJob(name string, prog *config.Program) *Job {
 	for i := range running {
 		running[i] = false
 	}
+
+	ch := make(chan struct{})
+	close(ch)
 
 	return &Job{
 		Name:          name,
@@ -86,7 +90,14 @@ func NewJob(name string, prog *config.Program) *Job {
 		NumProcs:      prog.NumProcs,
 		cmds:          make([]*exec.Cmd, prog.NumProcs),
 		pgid:          0,
+		startReady:    ch,
 	}
+}
+
+func (j *Job) closeStartReady() {
+	j.startOnce.Do(func() {
+		close(j.startReady)
+	})
 }
 
 type WorkerFn = func(j *Job, wg *sync.WaitGroup, _done chan bool) error
@@ -94,61 +105,57 @@ type WorkerFn = func(j *Job, wg *sync.WaitGroup, _done chan bool) error
 func (j *Job) Start(wg *sync.WaitGroup, _done chan bool) error {
 	defer func() { _done <- true }()
 
-	j.mustart.Lock()
-	done := make(chan bool, j.NumProcs)
-	defer close(done)
+	j.mustop.Lock()
+	defer j.mustop.Unlock()
+
+	startReady := make(chan struct{})
+	j.startReady = startReady
+	j.startOnce = sync.Once{}
 
 	for i := range j.NumProcs {
 		if j.Is(STOPPING, i) || j._running[i] {
-			done <- true
 			continue
 		}
 
 		j._running[i] = true
 
 		if j.HasPgid() {
-			go j.startJobWorker(wg, i, done, j.pgid)
+			go j.startJobWorker(wg, i, j.pgid)
 			continue
 		}
 
-		go j.startJobWorker(wg, i, done, 0)
-		<-done
-		done <- true
+		go j.startJobWorker(wg, i, 0)
+		<-startReady
 		if !j.Is(RUNNING, 0) {
 			return fmt.Errorf("process could not be running")
 		}
 		j.pgid = j.cmds[i].Process.Pid
 	}
 
-	for range j.NumProcs {
-		<-done
-	}
-	j.mustart.Unlock()
 	return nil
 }
 
-func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, done chan bool, pgid int) {
+func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, pgid int) {
 	wg.Add(1)
 	defer wg.Done()
 
-	cmd_list := []string{
-		"sh",
-		"-c",
-		fmt.Sprintf("umask %v && %v", j.Umask, j.Command),
-	}
-
-	cmd := exec.Command(cmd_list[0], cmd_list[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: pgid}
-
-	j.cmds[id] = cmd
-
 	retries := 0
 	for {
+		usePgid := pgid
+		if j.cmds[id] != nil && j.cmds[id].Process != nil {
+			usePgid = 0
+		}
+
+		cmd := exec.Command("sh", "-c", fmt.Sprintf("umask %v && %v", j.Umask, j.Command))
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: usePgid}
+		j.cmds[id] = cmd
+
 		j.SetState(STARTING, id)
 		err := j.tryStart(id)
 		if err != nil {
 			logger.Error(err)
 			j.SetState(BACKOFF, id)
+			j.closeStartReady()
 			retries++
 			if j.StartRetries == retries {
 				break
@@ -159,7 +166,7 @@ func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, done chan bool, pgid in
 
 		cur_ts := int(time.Now().Unix())
 		j.SetState(RUNNING, id)
-		done <- true
+		j.closeStartReady()
 		state, _ := j.cmds[id].Process.Wait()
 		j.cmds[id].ProcessState = state
 
@@ -181,10 +188,15 @@ func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, done chan bool, pgid in
 			break
 		}
 		if j.Autorestart == AUTORESTART_UNEXPECTED {
-			for exit := range j.ExitCodes {
+			expected := false
+			for _, exit := range j.ExitCodes {
 				if exit == j.cmds[id].ProcessState.ExitCode() {
+					expected = true
 					break
 				}
+			}
+			if expected {
+				break
 			}
 		}
 	}
@@ -245,25 +257,30 @@ func (j *Job) Restart(wg *sync.WaitGroup, _done chan bool) error {
 
 func (j *Job) Stop(wg *sync.WaitGroup, _done chan bool) error {
 	defer func() { _done <- true }()
+	<-j.startReady
 	j.mustop.Lock()
+	defer j.mustop.Unlock()
 
 	if j.HasPgid() {
 		for i := range j.NumProcs {
 			j.SetState(STOPPING, i)
 		}
-		cur := time.Now().Unix()
-		err := syscall.Kill(-j.pgid, syscall.SIGKILL)
+
+		err := syscall.Kill(-j.pgid, j.StopSignal)
 		if err != nil {
 			return err
 		}
 
+		cur := time.Now().Unix()
 		for time.Now().Unix()-cur < int64(j.StopWaitSecs) && j.IsRunning() {
 			time.Sleep(100 * time.Millisecond)
 		}
 
-		if j.HasPgid() {
-			err = syscall.Kill(-j.pgid, j.StopSignal)
-			return err
+		if j.HasPgid() && j.IsRunning() {
+			err = syscall.Kill(-j.pgid, syscall.SIGKILL)
+			if err != nil {
+				return err
+			}
 		}
 
 		for j.IsRunning() {
@@ -272,7 +289,6 @@ func (j *Job) Stop(wg *sync.WaitGroup, _done chan bool) error {
 	}
 
 	j.SetPgid(0)
-	j.mustop.Unlock()
 	return nil
 }
 

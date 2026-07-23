@@ -1,0 +1,6 @@
+[program.racetest]
+command = "sleep 3600"
+autostart = false
+autorestart = "false"
+startsecs = 0
+stopwaitsecs = 2
