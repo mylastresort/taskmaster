@@ -2,11 +2,14 @@ package logger
 
 import (
 	"fmt"
+	"log"
 	"log/syslog"
 	"os"
 	"sync"
 	"time"
 )
+
+const fallbackLogFile = "/var/log/taskmaster.log"
 
 type LogLevel uint8
 
@@ -33,9 +36,11 @@ func (lvl LogLevel) String() string {
 }
 
 type Logger struct {
-	level     LogLevel
-	mutex     sync.Mutex
-	syslogger *syslog.Writer
+	level          LogLevel
+	mutex          sync.Mutex
+	syslogger      *syslog.Writer
+	fallbackLogger *log.Logger
+	fallbackFile   *os.File
 }
 
 var logger Logger
@@ -44,7 +49,18 @@ func Init() {
 	syslogger, err := syslog.New(syslog.LOG_INFO, "taskmaster")
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: syslog unavailable, logging to stdout only: %v\n", err)
+		f, fileErr := os.OpenFile(fallbackLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if fileErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: syslog and file logging unavailable: syslog=%v file=%v\n", err, fileErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: syslog unavailable, falling back to %s\n", fallbackLogFile)
+			logger = Logger{
+				level:          InfoLevel,
+				fallbackLogger: log.New(f, "", 0),
+				fallbackFile:   f,
+			}
+			return
+		}
 	}
 
 	logger = Logger{
@@ -57,76 +73,92 @@ func SetLevel(level LogLevel) {
 	logger.level = level
 }
 
+func (l *Logger) writeSyslog(message string) {
+	if l.syslogger != nil {
+		l.syslogger.Info(message)
+	} else if l.fallbackLogger != nil {
+		l.fallbackLogger.Println(message)
+	}
+}
+
+func (l *Logger) writeSyslogWarn(message string) {
+	if l.syslogger != nil {
+		l.syslogger.Warning(message)
+	} else if l.fallbackLogger != nil {
+		l.fallbackLogger.Println(message)
+	}
+}
+
+func (l *Logger) writeSyslogErr(message string) {
+	if l.syslogger != nil {
+		l.syslogger.Err(message)
+	} else if l.fallbackLogger != nil {
+		l.fallbackLogger.Println(message)
+	}
+}
+
+func (l *Logger) writeSyslogCrit(message string) {
+	if l.syslogger != nil {
+		l.syslogger.Crit(message)
+	} else if l.fallbackLogger != nil {
+		l.fallbackLogger.Println(message)
+	}
+}
+
 func Info(a any) {
 	logger.log(InfoLevel, a)
 
-	if logger.syslogger != nil {
-		message := fmt.Sprintf("%v", a)
-		logger.syslogger.Info(message)
-	}
+	message := fmt.Sprintf("%v", a)
+	logger.writeSyslog(message)
 }
 
 func Infof(format string, a ...any) {
 	message := fmt.Sprintf(format, a...)
 	logger.log(InfoLevel, message)
 
-	if logger.syslogger != nil {
-		logger.syslogger.Info(message)
-	}
+	logger.writeSyslog(message)
 }
 
 func Warn(a any) {
 	logger.log(WarnLevel, a)
 
-	if logger.syslogger != nil {
-		message := fmt.Sprintf("%v", a)
-		logger.syslogger.Warning(message)
-	}
+	message := fmt.Sprintf("%v", a)
+	logger.writeSyslogWarn(message)
 }
 
 func Warnf(format string, a ...any) {
 	message := fmt.Sprintf(format, a...)
 	logger.log(WarnLevel, message)
 
-	if logger.syslogger != nil {
-		logger.syslogger.Warning(message)
-	}
+	logger.writeSyslogWarn(message)
 }
 
 func Error(a any) {
 	logger.log(ErrorLevel, a)
 
-	if logger.syslogger != nil {
-		message := fmt.Sprintf("%v", a)
-		logger.syslogger.Err(message)
-	}
+	message := fmt.Sprintf("%v", a)
+	logger.writeSyslogErr(message)
 }
 
 func Errorf(format string, a ...any) {
 	message := fmt.Sprintf(format, a...)
 	logger.log(ErrorLevel, message)
 
-	if logger.syslogger != nil {
-		logger.syslogger.Err(message)
-	}
+	logger.writeSyslogErr(message)
 }
 
 func Critical(a any) {
 	logger.log(CriticalLevel, a)
 
-	if logger.syslogger != nil {
-		message := fmt.Sprintf("%v", a)
-		logger.syslogger.Crit(message)
-	}
+	message := fmt.Sprintf("%v", a)
+	logger.writeSyslogCrit(message)
 }
 
 func Criticalf(format string, a ...any) {
 	message := fmt.Sprintf(format, a...)
 	logger.log(CriticalLevel, message)
 
-	if logger.syslogger != nil {
-		logger.syslogger.Crit(message)
-	}
+	logger.writeSyslogCrit(message)
 }
 
 func (l *Logger) log(level LogLevel, a any) {
