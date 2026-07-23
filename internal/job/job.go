@@ -12,6 +12,7 @@ import (
 	"github.com/Archer-01/taskmaster/internal/logger"
 	"github.com/Archer-01/taskmaster/internal/parser/config"
 	"github.com/Archer-01/taskmaster/internal/utils"
+	"github.com/creack/pty"
 )
 
 type Job struct {
@@ -39,6 +40,10 @@ type Job struct {
 	startReady    chan struct{}
 	startOnce     sync.Once
 	mustop        sync.Mutex
+	ptyFd         *os.File
+	ptyLoggerStop chan struct{}
+	ptyLoggerDone chan struct{}
+	ptyCloseOnce  sync.Once
 }
 
 func NewJob(name string, prog *config.Program) *Job {
@@ -141,13 +146,8 @@ func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, pgid int) {
 
 	retries := 0
 	for {
-		usePgid := pgid
-		if j.cmds[id] != nil && j.cmds[id].Process != nil {
-			usePgid = 0
-		}
-
 		cmd := exec.Command("sh", "-c", fmt.Sprintf("umask %v && %v", j.Umask, j.Command))
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: usePgid}
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 		j.cmds[id] = cmd
 
 		j.SetState(STARTING, id)
@@ -206,6 +206,17 @@ func (j *Job) startJobWorker(wg *sync.WaitGroup, id int, pgid int) {
 		j.SetState(STOPPED, id)
 	}
 	j._running[id] = false
+
+	if j.ptyLoggerStop != nil {
+		select {
+		case <-j.ptyLoggerStop:
+		default:
+			close(j.ptyLoggerStop)
+		}
+	}
+	if j.ptyLoggerDone != nil {
+		<-j.ptyLoggerDone
+	}
 }
 
 func (j *Job) setLog(file string, writer *utils.DynamicWriter, _default io.Writer) error {
@@ -222,27 +233,93 @@ func (j *Job) setLog(file string, writer *utils.DynamicWriter, _default io.Write
 	return nil
 }
 
+func (j *Job) ptyLogger(ptyMaster *os.File, stop chan struct{}, doneOnce *sync.Once, done chan struct{}) {
+	defer doneOnce.Do(func() { close(done) })
+	datac := make(chan []byte, 16)
+	errc := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := ptyMaster.Read(buf)
+			if n > 0 {
+				cp := make([]byte, n)
+				copy(cp, buf[:n])
+				datac <- cp
+			}
+			if err != nil {
+				errc <- err
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case <-stop:
+			return
+		case d := <-datac:
+			j.StdoutWriter.Write(d)
+		case <-errc:
+			return
+		}
+	}
+}
+
+func (j *Job) Attach() *os.File {
+	if j.ptyFd == nil {
+		return nil
+	}
+	select {
+	case <-j.ptyLoggerStop:
+	default:
+		close(j.ptyLoggerStop)
+	}
+	<-j.ptyLoggerDone
+	return j.ptyFd
+}
+
+func (j *Job) Detach() {
+	if j.ptyFd == nil {
+		return
+	}
+	j.ptyLoggerStop = make(chan struct{})
+	j.ptyLoggerDone = make(chan struct{})
+	j.ptyCloseOnce = sync.Once{}
+	go j.ptyLogger(j.ptyFd, j.ptyLoggerStop, &j.ptyCloseOnce, j.ptyLoggerDone)
+}
+
 func (j *Job) tryStart(procId int) error {
-	err := j.setLog(j.StdoutLogFile, j.StdoutWriter, os.Stdout)
-	if err != nil {
-		return err
+	cmd := j.cmds[procId]
+
+	cmd.Env = append(j.Environment, os.Environ()...)
+	cmd.Dir = j.Dir
+
+	j.setLog(j.StdoutLogFile, j.StdoutWriter, os.Stdout)
+	j.setLog(j.StderrLogFile, j.StderrWriter, os.Stderr)
+
+	if j.ptyLoggerStop != nil {
+		select {
+		case <-j.ptyLoggerStop:
+		default:
+			close(j.ptyLoggerStop)
+		}
+		if j.ptyLoggerDone != nil {
+			<-j.ptyLoggerDone
+		}
 	}
 
-	err = j.setLog(j.StderrLogFile, j.StderrWriter, os.Stderr)
-	if err != nil {
-		return err
+	j.ptyLoggerStop = make(chan struct{})
+	j.ptyLoggerDone = make(chan struct{})
+	j.ptyCloseOnce = sync.Once{}
+
+	ptmx, ptyErr := pty.Start(cmd)
+	if ptyErr != nil {
+		return ptyErr
 	}
+	j.ptyFd = ptmx
 
-	j.cmds[procId].Stdout = j.StdoutWriter
-	j.cmds[procId].Stderr = j.StderrWriter
+	pty.Setsize(ptmx, &pty.Winsize{Rows: 24, Cols: 80})
 
-	j.cmds[procId].Env = append(j.Environment, os.Environ()...)
-	j.cmds[procId].Dir = j.Dir
-
-	err = j.cmds[procId].Start()
-	if err != nil {
-		return err
-	}
+	go j.ptyLogger(ptmx, j.ptyLoggerStop, &j.ptyCloseOnce, j.ptyLoggerDone)
 
 	return nil
 }

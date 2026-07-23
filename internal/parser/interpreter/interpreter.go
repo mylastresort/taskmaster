@@ -13,6 +13,7 @@ const (
 	STOP    = "stop"
 	QUIT    = "quit"
 	EXIT    = "exit"
+	ATTACH  = "attach"
 )
 
 func Parse(line string) ([]string, error) {
@@ -23,7 +24,7 @@ func Parse(line string) ([]string, error) {
 	}
 
 	switch args[0] {
-	case RESTART, START, STATUS, STOP:
+	case RESTART, START, STATUS, STOP, ATTACH:
 		return args, nil
 
 	case RELOAD, QUIT, EXIT:

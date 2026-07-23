@@ -1,0 +1,7 @@
+[program.exitbad]
+command = "exit 42"
+autostart = true
+autorestart = "unexpected"
+startsecs = 0
+exitcodes = [0]
+startretries = 2

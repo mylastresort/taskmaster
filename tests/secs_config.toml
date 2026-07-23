@@ -1,0 +1,7 @@
+[program.earlyexit]
+command = "exit 0"
+autostart = true
+autorestart = "false"
+startsecs = 5
+startretries = 1
+exitcodes = [0]

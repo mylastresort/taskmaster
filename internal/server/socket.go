@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Archer-01/taskmaster/internal/logger"
+	"github.com/Archer-01/taskmaster/internal/manager"
 )
 
 type Socket struct {
@@ -84,11 +86,65 @@ func (_sv *Server) handleConnection(del byte, s *Socket, wg *sync.WaitGroup) {
 			}
 
 			res := _sv.j.Execute(cmd, args...)
+
+			if res.AttachFd != nil {
+				s.Con.Write([]byte("ATTACH OK" + string(del)))
+				_sv.handleAttach(s, res.AttachFd)
+				_sv.j.Execute(manager.DETACH, args[0])
+				continue
+			}
+
 			if res.Err != nil {
 				s.Con.Write([]byte(res.Err.Error() + string(del)))
 			} else {
 				s.Con.Write([]byte(res.Data + string(del)))
 			}
 		}
+	}
+}
+
+func (_sv *Server) handleAttach(s *Socket, ptyFd *os.File) {
+	done := make(chan struct{})
+	detach := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		buf := make([]byte, 4096)
+		for {
+			n, err := ptyFd.Read(buf)
+			if n > 0 {
+				_, werr := s.Con.Write(buf[:n])
+				if werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer close(detach)
+		buf := make([]byte, 4096)
+		for {
+			n, err := s.Con.Read(buf)
+			if n > 0 {
+				for i := 0; i < n-1; i++ {
+					if buf[i] == 0x01 && buf[i+1] == 0x04 {
+						return
+					}
+				}
+				ptyFd.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-detach:
 	}
 }

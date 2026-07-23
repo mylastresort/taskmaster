@@ -11,6 +11,7 @@ import (
 	"github.com/Archer-01/taskmaster/internal/server"
 	"github.com/Archer-01/taskmaster/internal/utils"
 	"github.com/chzyer/readline"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -62,6 +63,29 @@ func main() {
 			return
 		}
 
+		if args[0] == interpreter.ATTACH {
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "attach requires a process name\n")
+				continue
+			}
+			err = client.Send(strings.Join(args, " "))
+			if err != nil {
+				utils.Errorf(err.Error())
+				continue
+			}
+			res := client.Read(server.DEL)
+			if res.Err != nil {
+				utils.Errorf(res.Err.Error())
+				continue
+			}
+			if res.Data == "ATTACH OK" {
+				handleAttach(client)
+			} else if res.HasContent() {
+				utils.Logf(res.Data)
+			}
+			continue
+		}
+
 		err = client.Send(strings.Join(args, " "))
 		if err != nil {
 			utils.Errorf(err.Error())
@@ -74,4 +98,57 @@ func main() {
 			utils.Logf(res.Data)
 		}
 	}
+}
+
+func handleAttach(c *client.Client) {
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to enter raw mode: %v\n", err)
+		return
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	fmt.Fprintf(os.Stderr, "\r\n[Attached to process. Press Ctrl+A then D to detach.]\r\n")
+
+	done := make(chan struct{})
+	detach := make(chan struct{})
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				if n >= 2 && buf[0] == 0x01 && buf[1] == 0x04 {
+					c.Socket.Write([]byte{0x01, 0x04})
+					close(detach)
+					return
+				}
+				c.Socket.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer close(done)
+		buf := make([]byte, 4096)
+		for {
+			n, err := c.Socket.Read(buf)
+			if n > 0 {
+				os.Stdout.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-detach:
+	case <-done:
+	}
+	term.Restore(int(os.Stdin.Fd()), oldState)
+	fmt.Fprintf(os.Stderr, "\r\n[Detached.]\r\n")
 }

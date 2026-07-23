@@ -1,0 +1,8 @@
+[program.slowstop]
+command = "trap '' TERM; sleep 3600"
+autostart = true
+autorestart = "false"
+numprocs = 1
+startsecs = 0
+stopsignal = "TERM"
+stopwaitsecs = 2
