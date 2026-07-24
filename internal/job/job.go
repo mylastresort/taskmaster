@@ -15,30 +15,33 @@ import (
 )
 
 type Job struct {
-	Name          string
-	Command       string
-	cmds          []*exec.Cmd
-	Environment   []string
-	Dir           string
-	Autostart     bool
-	StdoutLogFile string
-	StderrLogFile string
-	Umask         string
-	State         []string
-	StartSecs     int
-	StartRetries  int
-	Autorestart   string
-	ExitCodes     []int
-	StopSignal    syscall.Signal
-	StopWaitSecs  int
-	_running      []bool
-	StdoutWriter  *utils.DynamicWriter
-	StderrWriter  *utils.DynamicWriter
-	NumProcs      int
-	pgid          int
-	startReady    chan struct{}
-	startOnce     sync.Once
-	mustop        sync.Mutex
+	Name           string
+	Command        string
+	cmds           []*exec.Cmd
+	Environment    []string
+	Dir            string
+	Autostart      bool
+	StdoutLogFile  string
+	StderrLogFile  string
+	Umask          string
+	State          []string
+	StartSecs      int
+	StartRetries   int
+	Autorestart    string
+	ExitCodes      []int
+	StopSignal     syscall.Signal
+	StopWaitSecs   int
+	Priority       int
+	RedirectStderr bool
+	ProcessName    string
+	_running       []bool
+	StdoutWriter   *utils.DynamicWriter
+	StderrWriter   *utils.DynamicWriter
+	NumProcs       int
+	pgid           int
+	startReady     chan struct{}
+	startOnce      sync.Once
+	mustop         sync.Mutex
 }
 
 func NewJob(name string, prog *config.Program) *Job {
@@ -69,28 +72,31 @@ func NewJob(name string, prog *config.Program) *Job {
 	close(ch)
 
 	return &Job{
-		Name:          name,
-		Command:       prog.Command,
-		Dir:           prog.Directory,
-		Autostart:     prog.Autostart,
-		Environment:   prog.Environment,
-		StdoutLogFile: prog.StdoutLogFile,
-		StderrLogFile: prog.StderrLogFile,
-		Umask:         prog.Umask,
-		State:         states,
-		StartSecs:     prog.StartSecs,
-		StartRetries:  prog.StartRetries,
-		Autorestart:   prog.Autorestart,
-		ExitCodes:     exit_codes,
-		StopSignal:    utils.ParseSignal(prog.StopSignal),
-		StopWaitSecs:  prog.StopWaitSecs,
-		_running:      running,
-		StdoutWriter:  &utils.DynamicWriter{},
-		StderrWriter:  &utils.DynamicWriter{},
-		NumProcs:      prog.NumProcs,
-		cmds:          make([]*exec.Cmd, prog.NumProcs),
-		pgid:          0,
-		startReady:    ch,
+		Name:           name,
+		Command:        prog.Command,
+		Dir:            prog.Directory,
+		Autostart:      prog.Autostart,
+		Environment:    prog.Environment,
+		StdoutLogFile:  prog.StdoutLogFile,
+		StderrLogFile:  prog.StderrLogFile,
+		Umask:          prog.Umask,
+		State:          states,
+		StartSecs:      prog.StartSecs,
+		StartRetries:   prog.StartRetries,
+		Autorestart:    prog.Autorestart,
+		ExitCodes:      exit_codes,
+		StopSignal:     utils.ParseSignal(prog.StopSignal),
+		StopWaitSecs:   prog.StopWaitSecs,
+		Priority:       prog.Priority,
+		RedirectStderr: prog.RedirectStderr,
+		ProcessName:    prog.ProcessName,
+		_running:       running,
+		StdoutWriter:   &utils.DynamicWriter{},
+		StderrWriter:   &utils.DynamicWriter{},
+		NumProcs:       prog.NumProcs,
+		cmds:           make([]*exec.Cmd, prog.NumProcs),
+		pgid:           0,
+		startReady:     ch,
 	}
 }
 
@@ -98,6 +104,16 @@ func (j *Job) closeStartReady() {
 	j.startOnce.Do(func() {
 		close(j.startReady)
 	})
+}
+
+func (j *Job) DisplayName(procId int) string {
+	if j.ProcessName != "" {
+		return fmt.Sprintf(j.ProcessName, j.Name, procId)
+	}
+	if j.NumProcs == 1 {
+		return j.Name
+	}
+	return fmt.Sprintf("%s_%d", j.Name, procId)
 }
 
 type WorkerFn = func(j *Job, wg *sync.WaitGroup, _done chan bool) error
@@ -234,7 +250,11 @@ func (j *Job) tryStart(procId int) error {
 	}
 
 	j.cmds[procId].Stdout = j.StdoutWriter
-	j.cmds[procId].Stderr = j.StderrWriter
+	if j.RedirectStderr {
+		j.cmds[procId].Stderr = j.StdoutWriter
+	} else {
+		j.cmds[procId].Stderr = j.StderrWriter
+	}
 
 	j.cmds[procId].Env = append(j.Environment, os.Environ()...)
 	j.cmds[procId].Dir = j.Dir
@@ -367,6 +387,15 @@ func (j *Job) reread(prog *config.Program) bool {
 	j.Autorestart = prog.Autorestart
 	j.StartSecs = prog.StartSecs
 	j.StartRetries = prog.StartRetries
+	j.Priority = prog.Priority
+	j.ProcessName = prog.ProcessName
+
+	if prog.RedirectStderr != j.RedirectStderr {
+		j.RedirectStderr = prog.RedirectStderr
+		if j.IsRunning() {
+			shouldRestart = true
+		}
+	}
 
 	return shouldRestart
 }

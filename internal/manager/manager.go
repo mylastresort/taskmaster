@@ -3,6 +3,7 @@ package manager
 import (
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 
 	"github.com/Archer-01/taskmaster/internal/job"
@@ -102,25 +103,43 @@ func (m *JobManager) reload() error {
 		}
 	}
 
-	start := make([]chan bool, 0)
-	for name, prog := range conf.Programs {
+	type newJob struct {
+		name string
+		prog *config.Program
+	}
+	newJobs := make([]newJob, 0)
+	reloadJobs := make([]chan bool, 0)
 
+	for name, prog := range conf.Programs {
 		j, fd := m.Jobs[name]
 		d := make(chan bool, 1)
-		start = append(start, d)
 
 		if fd {
+			reloadJobs = append(reloadJobs, d)
 			go j.Reload(m.wg, d, prog)
 		} else {
-
-			j = job.NewJob(name, prog)
-			m.Jobs[name] = j
-
-			go j.Start(m.wg, d)
+			newJobs = append(newJobs, newJob{name: name, prog: prog})
 		}
 	}
 
+	sort.Slice(newJobs, func(i, k int) bool {
+		return newJobs[i].prog.Priority < newJobs[k].prog.Priority
+	})
+
+	start := make([]chan bool, 0)
+	for _, nj := range newJobs {
+		d := make(chan bool, 1)
+		start = append(start, d)
+		j := job.NewJob(nj.name, nj.prog)
+		m.Jobs[nj.name] = j
+		go j.Start(m.wg, d)
+	}
+
 	for _, _done := range stop {
+		defer close(_done)
+		<-_done
+	}
+	for _, _done := range reloadJobs {
 		defer close(_done)
 		<-_done
 	}
@@ -132,10 +151,24 @@ func (m *JobManager) reload() error {
 	return nil
 }
 
+func (m *JobManager) sortedJobs(reverse bool) []*job.Job {
+	jobs := make([]*job.Job, 0, len(m.Jobs))
+	for _, j := range m.Jobs {
+		jobs = append(jobs, j)
+	}
+	sort.Slice(jobs, func(i, k int) bool {
+		if reverse {
+			return jobs[i].Priority > jobs[k].Priority
+		}
+		return jobs[i].Priority < jobs[k].Priority
+	})
+	return jobs
+}
+
 func (m *JobManager) start() {
 	var done chan bool
 
-	for _, j := range m.Jobs {
+	for _, j := range m.sortedJobs(true) {
 		if !j.Autostart {
 			continue
 		}
@@ -194,7 +227,7 @@ func (m *JobManager) runWorkerJob(j *job.Job, worker job.WorkerFn, done chan boo
 	go worker(j, m.wg, done)
 }
 
-func (m *JobManager) runWorkerJobs(jobs map[string]*job.Job, worker job.WorkerFn, action Action, state string) {
+func (m *JobManager) runWorkerJobs(jobs []*job.Job, worker job.WorkerFn, action Action, state string) {
 	jobs_done := []chan bool{}
 	for _, j := range jobs {
 		_done := make(chan bool, 1)
@@ -224,18 +257,24 @@ func (m *JobManager) setJobs(state string, worker job.WorkerFn, action Action) {
 		}
 		m.runWorkerJob(j, worker, action.Done, state)
 	} else {
-		m.runWorkerJobs(m.Jobs, worker, action, state)
+		var sorted []*job.Job
+		if state == "STOPPING" {
+			sorted = m.sortedJobs(false)
+		} else {
+			sorted = m.sortedJobs(true)
+		}
+		m.runWorkerJobs(sorted, worker, action, state)
 	}
 }
 
 func getStatusFmt(j *job.Job) string {
 	if j.NumProcs == 1 {
-		return fmt.Sprintf("[%s]: %s", j.Name, j.State[0])
+		return fmt.Sprintf("[%s]: %s", j.DisplayName(0), j.State[0])
 	}
 
 	msg := ""
 	for i := range j.NumProcs {
-		msg += fmt.Sprintf("[%s_%d]: %s", j.Name, i, j.State[i])
+		msg += fmt.Sprintf("[%s]: %s", j.DisplayName(i), j.State[i])
 		if i != j.NumProcs-1 {
 			msg += "\n"
 		}
@@ -280,7 +319,7 @@ func (m *JobManager) getStatus(action Action) {
 func (m *JobManager) stop() {
 	var done chan bool
 
-	for _, j := range m.Jobs {
+	for _, j := range m.sortedJobs(false) {
 		logger.Infof("Exiting program %s", j.Name)
 		done = make(chan bool, 1)
 		defer close(done)

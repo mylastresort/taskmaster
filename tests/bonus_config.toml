@@ -1,0 +1,37 @@
+[program.high]
+command = "sleep 3600"
+autostart = true
+priority = 10
+stdout_logfile = "/tmp/test_taskmaster/high.log"
+
+[program.mid]
+command = "sleep 3600"
+autostart = true
+priority = 5
+stdout_logfile = "/tmp/test_taskmaster/mid.log"
+
+[program.low]
+command = "sleep 3600"
+autostart = true
+priority = 1
+stdout_logfile = "/tmp/test_taskmaster/low.log"
+
+[program.stderr_merge]
+command = "sh -c 'echo error_output >&2 && sleep 3600'"
+autostart = false
+redirect_stderr = true
+stdout_logfile = "/tmp/test_taskmaster/stderr_merge.log"
+startsecs = 0
+
+[program.custom_name]
+command = "sleep 3600"
+autostart = false
+numprocs = 2
+process_name = "custom_%s_%02d"
+stdout_logfile = "/tmp/test_taskmaster/custom_name.log"
+
+[program.default_name]
+command = "sleep 3600"
+autostart = false
+numprocs = 3
+stdout_logfile = "/tmp/test_taskmaster/default_name.log"
