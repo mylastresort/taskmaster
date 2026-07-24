@@ -6,37 +6,46 @@ import (
 	"io"
 	"os"
 	"strings"
-	"syscall"
-	"time"
 
 	"github.com/Archer-01/taskmaster/internal/client"
 	"github.com/Archer-01/taskmaster/internal/parser/interpreter"
 	"github.com/Archer-01/taskmaster/internal/server"
 	"github.com/Archer-01/taskmaster/internal/utils"
 	"github.com/chzyer/readline"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
 func main() {
+	args := os.Args[1:]
+
+	if len(args) >= 2 && args[0] == interpreter.ATTACH {
+		if err := runAttach(args[1]); err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	setup, err := utils.ParseSetupFile()
 	if err != nil {
 		utils.Errorf(err.Error())
 		return
 	}
 
-	client, err := client.NewClient(setup.Socket)
+	c, err := client.NewClient(setup.Socket)
 	if err != nil {
 		utils.Errorf(err.Error())
 		return
 	}
-	defer client.Close()
+	defer c.Close()
 
 	rl, err := readline.New(setup.Prompt)
 	if err != nil {
 		panic(err)
 	}
 
-	defer rl.Close()
+	defer func() { rl.Close() }()
 	rl.Config.EOFPrompt = ""
 
 	for {
@@ -55,52 +64,87 @@ func main() {
 			continue
 		}
 
-		args, err := interpreter.Parse(line)
+		parsed, err := interpreter.Parse(line)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 		}
-		if len(args) == 0 {
+		if len(parsed) == 0 {
 			continue
 		}
-		if args[0] == interpreter.EXIT {
+		if parsed[0] == interpreter.EXIT {
 			return
 		}
 
-		if args[0] == interpreter.ATTACH {
-			if len(args) < 2 {
+		if parsed[0] == interpreter.ATTACH {
+			if len(parsed) < 2 {
 				fmt.Fprintf(os.Stderr, "attach requires a process name\n")
 				continue
 			}
-			err = client.Send(strings.Join(args, " "))
+			err = c.Send(strings.Join(parsed, " "))
 			if err != nil {
 				utils.Errorf(err.Error())
 				continue
 			}
-			res := client.Read(server.DEL)
+			res := c.Read(server.DEL)
 			if res.Err != nil {
 				utils.Errorf(res.Err.Error())
 				continue
 			}
-		if res.Data == "ATTACH OK" {
-			handleAttach(client)
+			if res.Data == "ATTACH OK" {
+				rl.Close()
+				handleAttach(c)
+				rl, err = readline.New(setup.Prompt)
+				if err != nil {
+					panic(err)
+				}
+				rl.Config.EOFPrompt = ""
 			} else if res.HasContent() {
 				utils.Logf(res.Data)
 			}
 			continue
 		}
 
-		err = client.Send(strings.Join(args, " "))
+		err = c.Send(strings.Join(parsed, " "))
 		if err != nil {
 			utils.Errorf(err.Error())
 		}
 
-		res := client.Read(server.DEL)
+		res := c.Read(server.DEL)
 		if res.Err != nil {
 			utils.Errorf(res.Err.Error())
 		} else if res.HasContent() {
 			utils.Logf(res.Data)
 		}
 	}
+}
+
+func runAttach(name string) error {
+	setup, err := utils.ParseSetupFile()
+	if err != nil {
+		return err
+	}
+
+	c, err := client.NewClient(setup.Socket)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	err = c.Send("attach " + name)
+	if err != nil {
+		return err
+	}
+
+	res := c.Read(server.DEL)
+	if res.Err != nil {
+		return res.Err
+	}
+	if res.Data != "ATTACH OK" {
+		return fmt.Errorf("%s", res.Data)
+	}
+
+	handleAttach(c)
+	return nil
 }
 
 func handleAttach(c *client.Client) {
@@ -118,64 +162,75 @@ func handleAttach(c *client.Client) {
 	detach := make(chan struct{})
 	goroutineDone := make(chan struct{})
 
-	oldflags, _, _ := syscall.Syscall(syscall.SYS_FCNTL, uintptr(stdinFd), syscall.F_GETFL, 0)
-	syscall.Syscall(syscall.SYS_FCNTL, uintptr(stdinFd), syscall.F_SETFL, oldflags|syscall.O_NONBLOCK)
+	stdinStopR, stdinStopW, _ := os.Pipe()
+	go func() {
+		<-stop
+		stdinStopW.Close()
+	}()
 
 	go func() {
 		defer close(goroutineDone)
+		defer stdinStopR.Close()
 		buf := make([]byte, 4096)
+		stdinFdNum := int32(stdinFd)
+		stopFd := int32(stdinStopR.Fd())
 		for {
-			select {
-			case <-stop:
-				return
-			default:
+			fds := []unix.PollFd{
+				{Fd: stdinFdNum, Events: unix.POLLIN},
+				{Fd: stopFd, Events: unix.POLLIN},
 			}
-			n, err := os.Stdin.Read(buf)
-			if n > 0 {
-				if n >= 2 && buf[0] == 0x01 && buf[1] == 0x04 {
-					c.Socket.Write([]byte{0x01, 0x04})
-					close(detach)
+			n, err := unix.Poll(fds, -1)
+			if err != nil {
+				if err == unix.EINTR {
+					continue
+				}
+				return
+			}
+			if n == 0 {
+				continue
+			}
+			if fds[1].Revents != 0 {
+				return
+			}
+			if fds[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0 {
+				nr, rerr := unix.Read(stdinFd, buf)
+				if nr > 0 {
+					if nr >= 2 && buf[0] == 0x01 && buf[1] == 0x04 {
+						c.Socket.Write([]byte{0x01, 0x04})
+						close(detach)
+						return
+					}
+					c.Socket.Write(buf[:nr])
+				}
+				if rerr != nil {
 					return
 				}
-				c.Socket.Write(buf[:n])
-			}
-			if err != nil {
-				time.Sleep(time.Millisecond)
 			}
 		}
 	}()
 
 	go func() {
-		var buf []byte
 		tmp := make([]byte, 4096)
+		marker := []byte("DETACH OK\r")
+		var leftover []byte
 		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			n, err := c.Rd.Read(tmp)
+			n, err := c.Socket.Read(tmp)
 			if n > 0 {
-				buf = append(buf, tmp[:n]...)
-				for {
-					idx := bytes.Index(buf, []byte("DETACH OK\r"))
-					if idx < 0 {
-						break
-					}
+				leftover = append(leftover, tmp[:n]...)
+				idx := bytes.Index(leftover, marker)
+				if idx >= 0 {
 					if idx > 0 {
-						os.Stdout.Write(buf[:idx])
+						os.Stdout.Write(leftover[:idx])
 					}
 					close(stop)
 					return
 				}
-				if len(buf) > 0 && !bytes.Contains(buf, []byte("DETACH")) {
-					os.Stdout.Write(buf)
-					buf = nil
-				}
+				os.Stdout.Write(leftover)
+				leftover = leftover[:0]
 			}
 			if err != nil {
-				if len(buf) > 0 {
-					os.Stdout.Write(buf)
+				if len(leftover) > 0 {
+					os.Stdout.Write(leftover)
 				}
 				close(stop)
 				return
@@ -190,7 +245,6 @@ func handleAttach(c *client.Client) {
 
 	<-goroutineDone
 
-	syscall.Syscall(syscall.SYS_FCNTL, uintptr(stdinFd), syscall.F_SETFL, oldflags)
 	term.Restore(stdinFd, oldState)
 	fmt.Fprintf(os.Stderr, "\r\n[Detached.]\r\n")
 }

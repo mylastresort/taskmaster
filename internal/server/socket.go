@@ -11,6 +11,7 @@ import (
 
 	"github.com/Archer-01/taskmaster/internal/logger"
 	"github.com/Archer-01/taskmaster/internal/manager"
+	"golang.org/x/sys/unix"
 )
 
 type Socket struct {
@@ -105,22 +106,47 @@ func (_sv *Server) handleConnection(del byte, s *Socket, wg *sync.WaitGroup) {
 }
 
 func (_sv *Server) handleAttach(s *Socket, ptyFd *os.File) {
+	stopR, stopW, _ := os.Pipe()
+	defer stopR.Close()
+
 	done := make(chan struct{})
 	detach := make(chan struct{})
 
 	go func() {
 		defer close(done)
 		buf := make([]byte, 4096)
+		ptyFdNum := int(ptyFd.Fd())
+		stopFd := int(stopR.Fd())
 		for {
-			n, err := ptyFd.Read(buf)
-			if n > 0 {
-				_, werr := s.Con.Write(buf[:n])
-				if werr != nil {
+			fds := []unix.PollFd{
+				{Fd: int32(ptyFdNum), Events: unix.POLLIN},
+				{Fd: int32(stopFd), Events: unix.POLLIN},
+			}
+			n, err := unix.Poll(fds, -1)
+			if err != nil {
+				if err == unix.EINTR {
+					continue
+				}
+				return
+			}
+			if n == 0 {
+				continue
+			}
+			if fds[1].Revents != 0 {
+				return
+			}
+			if fds[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0 {
+				nr, rerr := ptyFd.Read(buf)
+				if nr > 0 {
+					_, werr := s.Con.Write(buf[:nr])
+					if werr != nil {
+						stopW.Close()
+						return
+					}
+				}
+				if rerr != nil {
 					return
 				}
-			}
-			if err != nil {
-				return
 			}
 		}
 	}()
@@ -133,12 +159,14 @@ func (_sv *Server) handleAttach(s *Socket, ptyFd *os.File) {
 			if n > 0 {
 				for i := 0; i < n-1; i++ {
 					if buf[i] == 0x01 && buf[i+1] == 0x04 {
+						stopW.Close()
 						return
 					}
 				}
 				ptyFd.Write(buf[:n])
 			}
 			if err != nil {
+				stopW.Close()
 				return
 			}
 		}
@@ -146,6 +174,10 @@ func (_sv *Server) handleAttach(s *Socket, ptyFd *os.File) {
 
 	select {
 	case <-done:
+		stopW.Close()
+		<-detach
 	case <-detach:
+		stopW.Close()
+		<-done
 	}
 }
