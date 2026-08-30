@@ -1,18 +1,19 @@
 package utils
 
 import (
+	"os/user"
 	"strconv"
 	"syscall"
-	"os/user"
 
 	"github.com/Archer-01/taskmaster/internal/parser/config"
 	"github.com/BurntSushi/toml"
 )
 
 type Setup struct {
-	Prompt string `toml:"prompt"`
-	Socket string `toml:"socket" validate:"default=/tmp/taskmaster.sock"`
-	Config string `toml:"config" validate:"default=taskmaster.toml"`
+	Prompt  string `toml:"prompt"`
+	Socket  string `toml:"socket"`
+	Config  string `toml:"config" validate:"default=taskmaster.toml"`
+	LogFile string `toml:"logfile"`
 }
 
 const (

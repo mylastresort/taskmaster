@@ -20,7 +20,16 @@ func main() {
 		return
 	}
 
-	client, err := client.NewClient(setup.Socket)
+	socket := setup.Socket
+	if len(os.Args) > 1 {
+		socket = os.Args[1]
+	}
+	if socket == "" {
+		fmt.Fprintln(os.Stderr, "usage: go run ./cmd/client <socket> (path printed by taskmasterd)")
+		return
+	}
+
+	client, err := client.NewClient(socket)
 	if err != nil {
 		utils.Errorf(err.Error())
 		return

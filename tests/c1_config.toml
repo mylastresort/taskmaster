@@ -1,6 +1,0 @@
-[program.shortlived]
-command = "sleep 0.5"
-autostart = true
-autorestart = "true"
-startsecs = 0
-startretries = 5

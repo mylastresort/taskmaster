@@ -28,7 +28,7 @@ func (j *Job) SetState(state string, procId int) error {
 	case STOPPED:
 		j.State[procId] = STOPPED
 		if true {
-			j.pgid = 0
+			j.pgid[procId] = 0
 		}
 	default:
 		return fmt.Errorf("invalid state: %s", state)
@@ -40,12 +40,12 @@ func (j *Job) Is(state string, procId int) bool {
 	return j.State[procId] == state
 }
 
-func (j *Job) HasPgid() bool {
-	return j.pgid != 0
+func (j *Job) HasPgid(procId int) bool {
+	return j.pgid[procId] != 0
 }
 
-func (j *Job) SetPgid(num int) {
-	j.pgid = num
+func (j *Job) SetPgid(procId int, num int) {
+	j.pgid[procId] = num
 }
 
 func (j *Job) IsRunning() bool {
@@ -55,4 +55,12 @@ func (j *Job) IsRunning() bool {
 		}
 	}
 	return false
+}
+
+func (j *Job) isRunningProc(procId int) bool {
+	return j._running[procId]
+}
+
+func (j *Job) procAlive(id int) bool {
+	return j._running[id] && j.HasPgid(id) && groupAlive(j.pgid[id])
 }

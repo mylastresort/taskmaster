@@ -1,3 +1,0 @@
-socket = "/tmp/test_taskmaster.sock"
-prompt = "taskmaster> "
-config = "/tmp/test_taskmaster/ar_config.toml"

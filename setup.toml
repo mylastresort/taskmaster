@@ -1,2 +1,2 @@
-socket = "/tmp/taskmaster.sock"
 prompt = "taskmaster> "
+logfile = "/log/taskmaster.log"

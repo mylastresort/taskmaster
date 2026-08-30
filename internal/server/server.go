@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -52,6 +53,19 @@ func (s *Server) Stop() {
 }
 
 func (s *Server) Init() error {
+	if _, err := os.Stat(s.addr); err == nil {
+		// Socket file already exists: only remove it if nothing is
+		// actually listening on it (stale leftover from a crash).
+		if con, derr := net.Dial("unix", s.addr); derr == nil {
+			con.Close()
+			return fmt.Errorf("another instance is already listening on %s", s.addr)
+		}
+		logger.Info("Removing stale socket " + s.addr)
+		if err := os.Remove(s.addr); err != nil {
+			return err
+		}
+	}
+
 	sock, err := net.Listen("unix", s.addr)
 	if err != nil {
 		return err

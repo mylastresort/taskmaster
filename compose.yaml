@@ -7,5 +7,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
+    environment:
+      LOG_LEVEL: INFO
     volumes:
       - /dev/log:/dev/log
+      - ./taskmaster.toml:/app/taskmaster.toml

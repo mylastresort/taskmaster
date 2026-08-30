@@ -1,4 +1,0 @@
-[program.procname]
-command = "sleep 3600"
-autostart = false
-autorestart = "false"

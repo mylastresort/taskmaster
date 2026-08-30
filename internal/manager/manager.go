@@ -3,6 +3,7 @@ package manager
 import (
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 
 	"github.com/Archer-01/taskmaster/internal/job"
@@ -88,7 +89,7 @@ func (m *JobManager) reload() error {
 			os.Exit(1)
 		}
 
-		fmt.Println("[NOTICE] De-escalation successful")
+		logger.Info("[NOTICE] De-escalation successful")
 	}
 
 	stop := make([]chan bool, 0)
@@ -97,30 +98,48 @@ func (m *JobManager) reload() error {
 		if !fd {
 			d := make(chan bool, 1)
 			stop = append(stop, d)
-			go j.Stop(m.wg, d)
+			go j.Stop(m.wg, d, -1, 1)
 			delete(m.Jobs, name)
 		}
 	}
 
-	start := make([]chan bool, 0)
-	for name, prog := range conf.Programs {
+	type newJob struct {
+		name string
+		prog *config.Program
+	}
+	newJobs := make([]newJob, 0)
+	reloadJobs := make([]chan bool, 0)
 
+	for name, prog := range conf.Programs {
 		j, fd := m.Jobs[name]
 		d := make(chan bool, 1)
-		start = append(start, d)
 
 		if fd {
+			reloadJobs = append(reloadJobs, d)
 			go j.Reload(m.wg, d, prog)
 		} else {
-
-			j = job.NewJob(name, prog)
-			m.Jobs[name] = j
-
-			go j.Start(m.wg, d)
+			newJobs = append(newJobs, newJob{name: name, prog: prog})
 		}
 	}
 
+	sort.Slice(newJobs, func(i, k int) bool {
+		return newJobs[i].prog.Priority < newJobs[k].prog.Priority
+	})
+
+	start := make([]chan bool, 0)
+	for _, nj := range newJobs {
+		d := make(chan bool, 1)
+		start = append(start, d)
+		j := job.NewJob(nj.name, nj.prog)
+		m.Jobs[nj.name] = j
+		go j.Start(m.wg, d, -1, 1)
+	}
+
 	for _, _done := range stop {
+		defer close(_done)
+		<-_done
+	}
+	for _, _done := range reloadJobs {
 		defer close(_done)
 		<-_done
 	}
@@ -132,10 +151,24 @@ func (m *JobManager) reload() error {
 	return nil
 }
 
+func (m *JobManager) sortedJobs(reverse bool) []*job.Job {
+	jobs := make([]*job.Job, 0, len(m.Jobs))
+	for _, j := range m.Jobs {
+		jobs = append(jobs, j)
+	}
+	sort.Slice(jobs, func(i, k int) bool {
+		if reverse {
+			return jobs[i].Priority > jobs[k].Priority
+		}
+		return jobs[i].Priority < jobs[k].Priority
+	})
+	return jobs
+}
+
 func (m *JobManager) start() {
 	var done chan bool
 
-	for _, j := range m.Jobs {
+	for _, j := range m.sortedJobs(true) {
 		if !j.Autostart {
 			continue
 		}
@@ -143,7 +176,7 @@ func (m *JobManager) start() {
 		done = make(chan bool, 1)
 		defer close(done)
 		logger.Infof("[STARTING] Program(name=%s)", j.Name)
-		j.Start(m.wg, done)
+		j.Start(m.wg, done, -1, 1)
 		<-done
 	}
 }
@@ -161,23 +194,23 @@ func (m *JobManager) Run() {
 			action.Done <- true
 			return
 
-	case RELOAD:
-		logger.Warn("Reloading...")
-		if err := m.reload(); err != nil {
-			action.Data <- err.Error()
-			action.Done <- false
-		} else {
-			action.Done <- true
-		}
+		case RELOAD:
+			logger.Warn("Reloading...")
+			if err := m.reload(); err != nil {
+				action.Data <- err.Error()
+				action.Done <- false
+			} else {
+				action.Done <- true
+			}
 
 		case START:
-			m.setJobs("STARTING", (*job.Job).Start, action)
+			m.setJobs("STARTING", (*job.Job).Start, action, -1, 1)
 
 		case STOP:
-			m.setJobs("STOPPING", (*job.Job).Stop, action)
+			m.setJobs("STOPPING", (*job.Job).Stop, action, -1, 1)
 
 		case RESTART:
-			m.setJobs("RESTARTING", (*job.Job).Restart, action)
+			m.setJobs("RESTARTING", (*job.Job).Restart, action, -1, 1)
 
 		case STATUS:
 			m.getStatus(action)
@@ -189,17 +222,17 @@ func (m *JobManager) Run() {
 	}
 }
 
-func (m *JobManager) runWorkerJob(j *job.Job, worker job.WorkerFn, done chan bool, state string) {
+func (m *JobManager) runWorkerJob(j *job.Job, worker job.WorkerFn, done chan bool, state string, procId int) {
 	logger.Infof("[%s] Program(name=%s)", state, j.Name)
-	go worker(j, m.wg, done)
+	go worker(j, m.wg, done, procId, 1)
 }
 
-func (m *JobManager) runWorkerJobs(jobs map[string]*job.Job, worker job.WorkerFn, action Action, state string) {
+func (m *JobManager) runWorkerJobs(jobs []*job.Job, worker job.WorkerFn, action Action, state string) {
 	jobs_done := []chan bool{}
 	for _, j := range jobs {
 		_done := make(chan bool, 1)
 		jobs_done = append(jobs_done, _done)
-		m.runWorkerJob(j, worker, _done, state)
+		m.runWorkerJob(j, worker, _done, state, -1)
 	}
 	for _, _done := range jobs_done {
 		defer close(_done)
@@ -208,7 +241,7 @@ func (m *JobManager) runWorkerJobs(jobs map[string]*job.Job, worker job.WorkerFn
 	action.Done <- true
 }
 
-func (m *JobManager) setJobs(state string, worker job.WorkerFn, action Action) {
+func (m *JobManager) setJobs(state string, worker job.WorkerFn, action Action, procId int, count int) {
 	if len(action.Args) != 1 {
 		action.Data <- "command accepts 1 argument only"
 		action.Done <- false
@@ -222,20 +255,26 @@ func (m *JobManager) setJobs(state string, worker job.WorkerFn, action Action) {
 			action.Done <- false
 			return
 		}
-		m.runWorkerJob(j, worker, action.Done, state)
+		m.runWorkerJob(j, worker, action.Done, state, procId)
 	} else {
-		m.runWorkerJobs(m.Jobs, worker, action, state)
+		var sorted []*job.Job
+		if state == "STOPPING" {
+			sorted = m.sortedJobs(false)
+		} else {
+			sorted = m.sortedJobs(true)
+		}
+		m.runWorkerJobs(sorted, worker, action, state)
 	}
 }
 
 func getStatusFmt(j *job.Job) string {
 	if j.NumProcs == 1 {
-		return fmt.Sprintf("[%s]: %s", j.Name, j.State[0])
+		return fmt.Sprintf("[%s]: %s", j.DisplayName(0), j.State[0])
 	}
 
 	msg := ""
 	for i := range j.NumProcs {
-		msg += fmt.Sprintf("[%s_%d]: %s", j.Name, i, j.State[i])
+		msg += fmt.Sprintf("[%s]: %s", j.DisplayName(i), j.State[i])
 		if i != j.NumProcs-1 {
 			msg += "\n"
 		}
@@ -280,12 +319,12 @@ func (m *JobManager) getStatus(action Action) {
 func (m *JobManager) stop() {
 	var done chan bool
 
-	for _, j := range m.Jobs {
+	for _, j := range m.sortedJobs(false) {
 		logger.Infof("Exiting program %s", j.Name)
 		done = make(chan bool, 1)
 		defer close(done)
 		logger.Infof("[STOPPING] Program(name=%s)", j.Name)
-		j.Stop(m.wg, done)
+		j.Stop(m.wg, done, -1, 1)
 		<-done
 	}
 }

@@ -34,11 +34,19 @@ func (m *JobManager) WaitForSignals(wg *sync.WaitGroup) {
 		switch sig {
 
 		case syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT:
-			m.actions <- Action{Type: QUIT}
+			m.actions <- Action{
+				Type: QUIT,
+				Done: make(chan bool, 1),
+				Data: make(chan string, 1),
+			}
 			return
 
 		case syscall.SIGHUP:
-			m.actions <- Action{Type: RELOAD}
+			m.actions <- Action{
+				Type: RELOAD,
+				Done: make(chan bool, 1),
+				Data: make(chan string, 1),
+			}
 
 		}
 	}
